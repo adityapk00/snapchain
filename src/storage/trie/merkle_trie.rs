@@ -114,6 +114,24 @@ impl MerkleTrie {
         })
     }
 
+    // ========= TEMP
+    pub fn get_x_key(&self, key: &[u8]) -> Vec<u8> {
+        (self.branch_xform.expand)(key)
+    }
+
+    pub fn get_x_node(&self, db: &RocksDB, xprefix: &[u8]) -> Option<TrieNode> {
+        let node_key = TrieNode::make_primary_key(&xprefix, None);
+
+        if let Some(node_bytes) = db.get(&node_key).ok().flatten() {
+            if let Ok(node) = TrieNode::deserialize(&node_bytes) {
+                return Some(node);
+            }
+        }
+
+        None
+    }
+    // ========= TEMP
+
     fn create_empty_root(&mut self, txn_batch: &mut RocksDbTransactionBatch) {
         let root_key = TrieNode::make_primary_key(&[], None);
         let empty = TrieNode::new();
@@ -389,6 +407,12 @@ impl MerkleTrie {
 
     pub fn branching_factor(&self) -> u32 {
         self.branching_factor
+    }
+
+    pub(crate) fn items_at(&self, db: &RocksDB, prefix: &[u8]) -> usize {
+        self.get_node(db, &mut RocksDbTransactionBatch::new(), prefix)
+            .map(|node| node.items())
+            .unwrap_or(0)
     }
 }
 

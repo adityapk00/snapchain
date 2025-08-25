@@ -204,6 +204,10 @@ impl TrieNode {
         &self.children
     }
 
+    pub fn child_hashes(&self) -> &HashMap<u8, Vec<u8>> {
+        &self.child_hashes
+    }
+
     pub fn get_node_from_trie(
         &mut self,
         ctx: &Context,

@@ -1,6 +1,6 @@
-use crate::proto::OnChainEventType;
+use crate::proto::{ChildHashDebugInfo, OnChainEventType, TrieNodeDebugInfo};
 use crate::storage::store::account::FID_BYTES;
-use crate::storage::trie::merkle_trie;
+use crate::storage::trie::{self, merkle_trie};
 use crate::{
     core::util,
     proto,
@@ -108,6 +108,71 @@ impl Replicator {
         )
     }
 
+    pub fn get_trie_debug_info(
+        &self,
+        shard: u32,
+        fid: u64,
+        height: u64,
+    ) -> Result<Vec<TrieNodeDebugInfo>, String> {
+        match self.stores.get(shard, height) {
+            Some(stores) => {
+                let mut result = vec![];
+
+                let trie = stores.trie;
+                let fid_key = TrieKey::for_fid(fid);
+                let xfid_key = trie.get_x_key(&fid_key);
+
+                // For every prefix in xfid_key, get the node's debug info
+                for i in 0..(xfid_key.len() + 1) {
+                    let xprefix = xfid_key[..i].to_vec();
+                    let debug_info = self.get_trie_debug_at_xprefix(shard, height, xprefix)?;
+                    result.push(debug_info);
+                }
+
+                Ok(result)
+            }
+            None => Err(format!("No stores found for shard {}", shard)),
+        }
+    }
+
+    pub fn get_trie_debug_at_xprefix(
+        &self,
+        shard: u32,
+        height: u64,
+        xprefix: Vec<u8>,
+    ) -> Result<TrieNodeDebugInfo, String> {
+        match self.stores.get(shard, height) {
+            Some(stores) => {
+                let db = stores.db.clone();
+                let trie = stores.trie;
+
+                let node = trie
+                    .get_x_node(&db, &xprefix)
+                    .ok_or_else(|| format!("Failed to get trie node for prefix {:?}", xprefix))?;
+                let node_hash = node.hash();
+
+                let child_hashes = node
+                    .child_hashes()
+                    .iter()
+                    .map(|(k, v)| ChildHashDebugInfo {
+                        char: *k as u32,
+                        hash: v.clone(),
+                    })
+                    .collect();
+
+                let debug_info = TrieNodeDebugInfo {
+                    xprefix,
+                    hash: node_hash,
+                    child_hashes,
+                    items: node.items() as u64,
+                };
+
+                Ok(debug_info)
+            }
+            None => Err(format!("No stores found for shard {}", shard)),
+        }
+    }
+
     pub fn latest_transactions_for_fid(
         &self,
         shard: u32,
@@ -167,11 +232,13 @@ impl Replicator {
             (Some(_), Some(_)) => unreachable!(), // Already handled above
         };
 
-        let iterator_fid = cursor.token.fid().saturating_sub(1);
-        let fid_iterator = FIDIterator::new(stores.db.clone(), iterator_fid);
+        // let iterator_fid = cursor.token.fid().saturating_sub(1);
+        // let fid_iterator = FIDIterator::new(stores.db.clone(), iterator_fid);
+        let fid_start = cursor.token.fid();
+        let end_fid = self.get_highest_fid_for_shard(shard, height)? + 20_000;
         let mut transactions = vec![];
 
-        for fid in fid_iterator.into_iter() {
+        for fid in fid_start..=end_fid {
             // This is commented out, but extremely useful for debugging. It diffs the merkle trie and the DB stores to
             // find message inconsistencies for FIDs
             // if let Err(e) = check_db_trie_consistency_for_fid(&stores, fid) {
@@ -207,6 +274,51 @@ impl Replicator {
         self.stores.get_metadata(shard)
     }
 
+    pub fn get_highest_fid_for_shard(
+        &self,
+        shard: u32,
+        height: u64,
+    ) -> Result<u64, ReplicationError> {
+        let stores = match self.stores.get(shard, height) {
+            Some(stores) => stores,
+            None => {
+                return Err(ReplicationError::StoreNotFound(
+                    shard,
+                    height,
+                    "No stores found for the given height and shard".to_string(),
+                ));
+            }
+        };
+
+        match stores.onchain_event_store.get_highest_fid() {
+            Ok(Some(fid)) => Ok(fid),
+            Ok(None) => Ok(0), // No FIDs found
+            Err(e) => Err(ReplicationError::InternalError(format!(
+                "Failed to get highest FID: {}",
+                e
+            ))),
+        }
+    }
+
+    pub fn get_shard_chunk_by_height(
+        &self,
+        shard_id: u32,
+        height: u64,
+    ) -> Result<Option<proto::ShardChunk>, ReplicationError> {
+        let stores = match self.stores.get(shard_id, height) {
+            Some(stores) => stores,
+            None => {
+                // This case is valid, it just means no snapshot exists for this height.
+                return Ok(None);
+            }
+        };
+
+        stores
+            .shard_store
+            .get_chunk_by_height(height)
+            .map_err(|e| ReplicationError::InternalError(e.to_string()))
+    }
+
     // Calculates the oldest timestamp that is still valid for snapshots.
     fn oldest_valid_timestamp(&self) -> Result<u64, ReplicationError> {
         let current_time = match util::get_farcaster_time() {
@@ -237,14 +349,13 @@ impl Replicator {
         };
 
         let timestamp = msg.header.timestamp;
-        let oldest_valid_timestamp = self.oldest_valid_timestamp()?;
+        let oldest_valid_timestamp = 0; // self.oldest_valid_timestamp()?;
 
         // Clean up old snapshots
         self.stores
             .close_aged_snapshots(msg.shard_id, oldest_valid_timestamp);
 
         // Check if we can take a snapshot of this block
-
         if block_number > 0 && block_number % self.snapshot_options.interval != 0 {
             return Ok(());
         }
@@ -252,6 +363,13 @@ impl Replicator {
         // Check if the timestamp is expired
         if timestamp < oldest_valid_timestamp {
             return Ok(());
+        }
+
+        // Check if the number of existing snapshots exceeds 10
+        if let Ok(metadata) = self.stores.get_metadata(msg.shard_id) {
+            if metadata.len() > 1 {
+                return Ok(());
+            }
         }
 
         // Open a snapshot

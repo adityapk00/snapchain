@@ -5,6 +5,7 @@ use tonic::{Request, Response, Status};
 use crate::mempool::routing;
 use crate::proto::{self, MessageType, OnChainEventType};
 use crate::replication::replicator::Replicator;
+use crate::storage::store::block::BlockStore;
 
 /// Extract the sort order Enums from the protos
 fn get_sort_order_from_request(
@@ -44,6 +45,7 @@ pub struct ReplicationServer {
     replicator: Arc<Replicator>,
     message_router: Box<dyn routing::MessageRouter>,
     num_shards: u32,
+    block_store: BlockStore,
 }
 
 impl ReplicationServer {
@@ -53,17 +55,46 @@ impl ReplicationServer {
         replicator: Arc<Replicator>,
         message_router: Box<dyn routing::MessageRouter>,
         num_shards: u32,
+        block_store: BlockStore,
     ) -> Self {
         ReplicationServer {
             replicator,
             message_router,
             num_shards,
+            block_store,
         }
     }
 }
 
 #[tonic::async_trait]
 impl proto::replication_service_server::ReplicationService for ReplicationServer {
+    async fn get_trie_debug_info(
+        &self,
+        request: Request<proto::GetTrieDebugInfoRequest>,
+    ) -> Result<Response<proto::GetTrieDebugInfoResponse>, Status> {
+        let request = request.into_inner();
+
+        let debug_info = if !request.xprefix.is_empty() && request.fid == 0 {
+            // Use the new method for xprefix-based debug info
+            let single_debug_info = self
+                .replicator
+                .get_trie_debug_at_xprefix(request.shard_id, request.height, request.xprefix)
+                .map_err(|e| {
+                    Status::internal(format!("Failed to get trie debug info at xprefix: {}", e))
+                })?;
+            vec![single_debug_info]
+        } else {
+            // Use the original method for fid-based debug info
+            self.replicator
+                .get_trie_debug_info(request.shard_id, request.fid, request.height)
+                .map_err(|e| Status::internal(format!("Failed to get trie debug info: {}", e)))?
+        };
+
+        Ok(Response::new(proto::GetTrieDebugInfoResponse {
+            debug_info,
+        }))
+    }
+
     async fn get_shard_snapshot_metadata(
         &self,
         request: Request<proto::GetShardSnapshotMetadataRequest>,
@@ -71,14 +102,39 @@ impl proto::replication_service_server::ReplicationService for ReplicationServer
         let request = request.into_inner();
 
         let snapshots = match self.replicator.get_snapshot_metadata(request.shard_id) {
-            Ok(metadata) => metadata
-                .into_iter()
-                .map(|(height, timestamp)| proto::ShardSnapshotMetadata {
-                    shard_id: request.shard_id,
-                    height,
-                    timestamp,
-                })
-                .collect(),
+            Ok(metadata) => {
+                let mut snapshots = Vec::new();
+                for (height, timestamp) in metadata {
+                    // Get the highest FID for this shard at this height
+                    let highest_fid = self
+                        .replicator
+                        .get_highest_fid_for_shard(request.shard_id, height)
+                        .unwrap_or(0);
+
+                    // Fetch the block for the given height
+                    let block = self.block_store.get_block_by_height(height).map_err(|e| {
+                        Status::internal(format!("Failed to get block by height: {}", e))
+                    })?;
+
+                    // Fetch the ShardChunk for the given shard and height from the replicator
+                    let shard_chunk = self
+                        .replicator
+                        .get_shard_chunk_by_height(request.shard_id, height)
+                        .map_err(|e| {
+                            Status::internal(format!("Failed to get shard chunk by height: {}", e))
+                        })?;
+
+                    snapshots.push(proto::ShardSnapshotMetadata {
+                        shard_id: request.shard_id,
+                        height,
+                        timestamp,
+                        highest_fid,
+                        block,
+                        shard_chunk,
+                    });
+                }
+                snapshots
+            }
             Err(e) => {
                 return Err(Status::internal(format!(
                     "Failed to get snapshot metadata: {}",

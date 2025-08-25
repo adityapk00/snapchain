@@ -257,6 +257,25 @@ impl Stores {
         }
     }
 
+    pub fn get_trie_root_for_fid(&mut self, fid: u64) -> (Vec<u8>, usize, Vec<Vec<u8>>) {
+        let db = &self.db;
+
+        let trie_key = TrieKey::for_fid(fid);
+        let root_hash = self
+            .trie
+            .get_hash(&db, &mut RocksDbTransactionBatch::new(), &trie_key);
+        let items = self.trie.items_at(&db, &trie_key);
+
+        let all_values = if items == 1 {
+            let ctx = &merkle_trie::Context::new();
+            self.trie.get_all_values(ctx, db, &trie_key).unwrap()
+        } else {
+            Vec::new()
+        };
+
+        (root_hash, items, all_values)
+    }
+
     fn make_schema_version_key() -> Vec<u8> {
         vec![RootPrefix::DBSchemaVersion as u8]
     }

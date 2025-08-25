@@ -3,6 +3,7 @@ use crate::core::{
     error::HubError, types::Height, util::FarcasterTime, validations, validations::verification,
 };
 use crate::mempool::mempool::MempoolMessagesRequest;
+use crate::mempool::routing::{MessageRouter, ShardRouter};
 use crate::proto::message_data::Body;
 use crate::proto::{
     self, hub_event, Block, FarcasterNetwork, HubEvent, HubEventType, MessageType, OnChainEvent,
@@ -200,7 +201,7 @@ impl ShardEngine {
         let stores = Stores::new(
             db.clone(),
             shard_id,
-            trie,
+            trie.clone(),
             store_limits,
             network,
             statsd_client.clone(),
@@ -222,6 +223,21 @@ impl ShardEngine {
                 info!(shard_id, "Background migrations started");
             }
         }
+
+        // let fid_to_check = 3;
+        // let id_event = stores
+        //     .onchain_event_store
+        //     .get_id_register_event_by_fid(fid_to_check, None);
+
+        // let trie_key = TrieKey::for_fid(fid_to_check);
+        // let node_hash = trie.get_hash(&db, &mut RocksDbTransactionBatch::new(), &trie_key);
+
+        // let shard_router = ShardRouter {};
+
+        // info!(
+        //     "Aditya: shard_id {} fid_to_check {}, id_event {:?} trie_node_hash {:?}. FID shard router {}",
+        //     shard_id, fid_to_check, id_event, node_hash, shard_router.route_fid(fid_to_check as u64, 2)
+        // );
 
         Ok(ShardEngine {
             shard_id,

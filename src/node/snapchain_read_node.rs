@@ -16,7 +16,7 @@ use libp2p::identity::ed25519::Keypair;
 use libp2p::PeerId;
 use std::collections::{BTreeMap, HashMap};
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 
 const MAX_SHARDS: u32 = 64;
 
@@ -107,6 +107,28 @@ impl SnapchainReadNode {
 
             consensus_actors.insert(shard_id, consensus_actor.unwrap());
         }
+
+        // for fid in 0..1_250_000 {
+        //     let s1_stores = shard_stores.get_mut(&1).expect("Shard 1 should exist");
+        //     let (root_hash1, items1, all_values1) = s1_stores.get_trie_root_for_fid(fid);
+
+        //     let s2_stores = shard_stores.get_mut(&2).expect("Shard 2 should exist");
+        //     let (root_hash2, items2, all_values2) = s2_stores.get_trie_root_for_fid(fid);
+
+        //     if !root_hash1.is_empty() && !root_hash2.is_empty() {
+        //         // Both shards have this
+        //         info!(
+        //             "Aditya: fid {} has root hash 1 {:} ({}) and root hash 2 {:} ({}). All values 1: {:?}, All values 2: {:?}",
+        //             fid,
+        //             hex::encode(root_hash1),
+        //             items1,
+        //             hex::encode(root_hash2),
+        //             items2,
+        //             all_values1,
+        //             all_values2
+        //         );
+        //     }
+        // }
 
         // Now create the block validator
         let block_shard = SnapchainShard::new(0);
