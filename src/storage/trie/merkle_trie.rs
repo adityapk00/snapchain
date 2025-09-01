@@ -202,10 +202,34 @@ impl MerkleTrie {
 
             // This node is in the Trie DB, but is not attached to the root. Now attach it
             let mut txn = RocksDbTransactionBatch::new();
-            root.attach_to_root(ctx, &mut HashMap::new(), db, &mut txn, 0, &xkey)?;
+            root.attach_to_root(ctx, db, &mut txn, 0, &xkey)?;
 
             txn_batch.merge(txn);
             return Ok((true, true));
+        } else {
+            Err(TrieError::TrieNotInitialized)
+        }
+    }
+
+    pub fn recalculate_hashes(
+        &mut self,
+        ctx: &Context,
+        db: &RocksDB,
+        txn_batch: &mut RocksDbTransactionBatch,
+        max_key_len: usize,
+    ) -> Result<(), TrieError> {
+        if let Some(root) = self.root.as_mut() {
+            // We need to translate the key levels into the xform levels. Use a sample key to do the transform
+            let key = vec![0u8; max_key_len];
+            let xkey = (self.branch_xform.expand)(&key);
+
+            let mut txn = RocksDbTransactionBatch::new();
+            root.recalculate_hashes(ctx, &mut HashMap::new(), db, &mut txn, xkey.len(), &[])?;
+
+            // Merge the transaction batch into the main transaction batch
+            txn_batch.merge(txn);
+
+            return Ok(());
         } else {
             Err(TrieError::TrieNotInitialized)
         }

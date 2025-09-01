@@ -18,6 +18,7 @@ message GetTrieDebugInfoRequest {
   uint32 shard_id = 1;
   uint64 fid = 2;
   uint64 height = 3;
+  bytes xprefix = 4;
 }
 
 message GetTrieDebugInfoResponse {
@@ -28,6 +29,7 @@ message TrieNodeDebugInfo {
   bytes xprefix = 1;
   bytes hash = 2;
   repeated ChildHashDebugInfo child_hashes = 3;
+  uint64 items = 4;
 }
 
 message ChildHashDebugInfo {

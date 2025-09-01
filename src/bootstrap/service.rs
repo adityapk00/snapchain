@@ -7,7 +7,7 @@ use crate::proto::get_shard_transactions_request::Cursor;
 use crate::proto::replication_service_client::ReplicationServiceClient;
 use crate::proto::{
     ChildHashDebugInfo, GetShardSnapshotMetadataRequest, GetShardTransactionsRequest,
-    ShardSnapshotMetadata, SortOrderTypes, Transaction, TrieNodeDebugInfo,
+    GetTrieDebugInfoRequest, ShardSnapshotMetadata, SortOrderTypes, Transaction, TrieNodeDebugInfo,
 };
 use crate::storage::constants::RootPrefix;
 use crate::storage::db::{RocksDB, RocksDbTransactionBatch};
@@ -16,10 +16,13 @@ use crate::storage::store::engine::ShardEngine;
 use crate::storage::store::stores::StoreLimits;
 use crate::storage::trie::errors::TrieError;
 use crate::storage::trie::merkle_trie::{self, TrieKey};
+use crate::storage::trie::trie_node::TrieNode;
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
 use crate::version::version::EngineVersion;
 use base64::{engine::general_purpose, Engine as _};
 use futures::future::try_join_all;
+use rand::seq::IteratorRandom;
+use rand::seq::SliceRandom;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -479,7 +482,9 @@ async fn start_shard_replication_outer(
     shutdown_signal: Arc<AtomicBool>,
 ) -> Result<WorkUnitResponse, BootstrapError> {
     // ============== TEMP
+
     if let Err(e) = post_process_trie(
+        peer_address,
         rocksdb_dir,
         trie_branching_factor,
         shard_id,
@@ -494,6 +499,7 @@ async fn start_shard_replication_outer(
     }
 
     return Ok(WorkUnitResponse::Stopped);
+    // ============== TEMP
 
     // Go over the FIDs in chunks of 10k and import them into the DB in batches. This allows the
     // DB to compact and flush every 10k FIDs, managing the SST files more efficiently.
@@ -523,19 +529,20 @@ async fn start_shard_replication_outer(
         if let WorkUnitResponse::NoMoreFIDs(_) = completed {
             info!("No more FIDs to process for shard {}. ", shard_id);
 
-            // if let Err(e) = post_process_trie(
-            //     rocksdb_dir,
-            //     trie_branching_factor,
-            //     shard_id,
-            //     highest_fid,
-            //     metadata,
-            //     shutdown_signal,
-            // )
-            // .await
-            // {
-            //     error!("Error post processing trie for shard {}: {}", shard_id, e);
-            //     return Err(BootstrapError::PostProcessError(e.to_string()));
-            // }
+            if let Err(e) = post_process_trie(
+                peer_address,
+                rocksdb_dir,
+                trie_branching_factor,
+                shard_id,
+                highest_fid,
+                metadata,
+                shutdown_signal,
+            )
+            .await
+            {
+                error!("Error post processing trie for shard {}: {}", shard_id, e);
+                return Err(BootstrapError::PostProcessError(e.to_string()));
+            }
 
             return Ok(completed);
         }
@@ -547,7 +554,7 @@ async fn start_shard_replication_outer(
 fn pretty_print_debug_info(info: &TrieNodeDebugInfo) {
     println!(
         "xPrefix: {}",
-        general_purpose::STANDARD.encode(&info.xprefix)
+        general_purpose::STANDARD.encode(&info.xprefix),
     );
     println!("hash: {}", general_purpose::STANDARD.encode(&info.hash));
     println!("'childHashes':");
@@ -598,6 +605,7 @@ fn get_trie_debug_info(
             .get_x_node(&db, &xprefix)
             .ok_or_else(|| format!("Failed to get trie node for prefix {:?}", xprefix))?;
         let node_hash = node.hash();
+        let node_items = node.items() as u64;
 
         let child_hashes = node
             .child_hashes()
@@ -612,6 +620,7 @@ fn get_trie_debug_info(
             xprefix,
             hash: node_hash,
             child_hashes,
+            items: node_items,
         };
         result.push(debug_info);
     }
@@ -619,7 +628,195 @@ fn get_trie_debug_info(
     return Ok(result);
 }
 
+/// Diff two tries: remote and local, finding the deepest level where they differ
+async fn diff_trie_debug_info(
+    remote_peer_address: &str,
+    db: &RocksDB,
+    trie: &merkle_trie::MerkleTrie,
+    shard_id: u32,
+    height: u64,
+) -> Result<(), BootstrapError> {
+    // Connect to remote peer
+    let mut remote_client = ReplicationServiceClient::connect(remote_peer_address.to_string())
+        .await
+        .map_err(|e| BootstrapError::PeerConnectionError(e.to_string()))?;
+
+    // Start with empty prefix (root)
+    let mut xprefix = vec![];
+
+    loop {
+        info!("Comparing trie nodes at xprefix: {:?}", xprefix);
+
+        // Get remote trie debug info
+        let remote_request = GetTrieDebugInfoRequest {
+            shard_id,
+            fid: 0, // Use 0 when using xprefix
+            height,
+            xprefix: xprefix.clone(),
+        };
+
+        let remote_response = match remote_client.get_trie_debug_info(remote_request).await {
+            Ok(response) => response.into_inner(),
+            Err(e) => {
+                info!("Remote trie node not found at xprefix {:?}: {}", xprefix, e);
+                break;
+            }
+        };
+
+        // Remote should return exactly one debug info for the requested xprefix
+        if remote_response.debug_info.is_empty() {
+            info!("Remote returned no debug info for xprefix {:?}", xprefix);
+            break;
+        }
+
+        let remote_debug_info = &remote_response.debug_info[0];
+
+        // Get local trie node (allow it to be None)
+        let local_node = trie.get_x_node(&db, &xprefix);
+
+        let (local_hash, local_items, local_child_hashes) = if let Some(node) = &local_node {
+            let hash = node.hash();
+            let items = node.items() as u64;
+            let child_hashes: HashMap<u32, Vec<u8>> = node
+                .child_hashes()
+                .iter()
+                .map(|(k, v)| (*k as u32, v.clone()))
+                .collect();
+            (Some(hash), items, child_hashes)
+        } else {
+            info!("Local trie node not found at xprefix {:?}", xprefix);
+            (None, 0, HashMap::new())
+        };
+
+        // Compare hashes
+        if let Some(local_hash) = &local_hash {
+            if remote_debug_info.hash == *local_hash {
+                info!("Trie nodes match at xprefix {:?}", xprefix);
+                break; // No difference found
+            }
+        }
+
+        info!("Trie node hash mismatch at xprefix {:?}", xprefix);
+        info!(
+            "Remote hash: {}",
+            general_purpose::STANDARD.encode(&remote_debug_info.hash)
+        );
+        if let Some(local_hash) = &local_hash {
+            info!(
+                "Local hash:  {}",
+                general_purpose::STANDARD.encode(&local_hash)
+            );
+        } else {
+            info!("Local hash:  None (node not found)");
+        }
+        info!(
+            "Remote items: {}, Local items: {}",
+            remote_debug_info.items, local_items
+        );
+
+        // Convert remote child hashes to HashMap for easier comparison
+        let remote_child_hashes: HashMap<u32, Vec<u8>> = remote_debug_info
+            .child_hashes
+            .iter()
+            .map(|child| (child.char, child.hash.clone()))
+            .collect();
+
+        // Find the first child hash that differs, or use the first remote child if local node is None
+        let mut differing_child: Option<u32> = None;
+
+        // If local node is None, use the first remote child to continue recursion
+        if local_node.is_none() {
+            if let Some(random_remote_child) = remote_child_hashes.keys().next() {
+                differing_child = Some(*random_remote_child);
+                info!(
+                    "Local node is None, using random remote child char {} to continue recursion",
+                    random_remote_child
+                );
+            }
+        } else {
+            // Check all children that exist in either remote or local
+            let mut all_child_chars: std::collections::BTreeSet<u32> =
+                std::collections::BTreeSet::new();
+            all_child_chars.extend(remote_child_hashes.keys());
+            all_child_chars.extend(local_child_hashes.keys());
+
+            // Randomly shuffle to get a different node everytime
+            let mut all_child_chars_vec: Vec<u32> = all_child_chars.into_iter().collect();
+            let mut rng = rand::thread_rng();
+            all_child_chars_vec.shuffle(&mut rng);
+            let all_child_chars = all_child_chars_vec;
+
+            for &child_char in &all_child_chars {
+                let remote_hash = remote_child_hashes.get(&child_char);
+                let local_hash = local_child_hashes.get(&child_char);
+
+                match (remote_hash, local_hash) {
+                    (Some(remote), Some(local)) => {
+                        if remote != local {
+                            info!(
+                                "Child hash differs for char {}: remote={}, local={}",
+                                child_char,
+                                general_purpose::STANDARD.encode(remote),
+                                general_purpose::STANDARD.encode(local)
+                            );
+                            differing_child = Some(child_char);
+                            break;
+                        }
+                    }
+                    (Some(remote), None) => {
+                        info!(
+                            "Child char {} exists in remote but not local: hash={}",
+                            child_char,
+                            general_purpose::STANDARD.encode(remote)
+                        );
+                        differing_child = Some(child_char);
+                        break;
+                    }
+                    (None, Some(local)) => {
+                        info!(
+                            "Child char {} exists in local but not remote: hash={}",
+                            child_char,
+                            general_purpose::STANDARD.encode(local)
+                        );
+                        differing_child = Some(child_char);
+                        break;
+                    }
+                    (None, None) => {
+                        // This shouldn't happen since we're iterating over keys that exist
+                        continue;
+                    }
+                }
+            }
+        }
+
+        match differing_child {
+            Some(child_char) => {
+                // Recurse one level deeper
+                xprefix.push(child_char as u8);
+                info!(
+                    "Recursing to xprefix {:?} (child char {})",
+                    xprefix, child_char
+                );
+            }
+            None => {
+                info!(
+                    "No differing child found at xprefix {:?}, stopping",
+                    xprefix
+                );
+                break;
+            }
+        }
+    }
+
+    info!(
+        "Trie diff completed. Deepest differing level: {:?}",
+        xprefix
+    );
+    Ok(())
+}
+
 async fn post_process_trie(
+    peer_address: &str,
     rocksdb_dir: &str,
     trie_branching_factor: u32,
     shard_id: u32,
@@ -640,19 +837,51 @@ async fn post_process_trie(
     // get_one_node_in_007(&db, &trie);
     // return Ok(());
 
-    let fid3_debug_info = get_trie_debug_info(&db, &trie, 29974);
-    if let Ok(info) = fid3_debug_info {
-        for i in info {
-            pretty_print_debug_info(&i);
-        }
+    let limit_shard = 1;
+    if shard_id != limit_shard {
+        return Ok(());
     }
+
+    let height = metadata.height;
+    diff_trie_debug_info(peer_address, &db, &trie, shard_id, height)
+        .await
+        .unwrap();
+
+    // let fid1 = 29974;
+    // let fid1_debug_info = get_trie_debug_info(&db, &trie, fid1);
+    // if let Ok(info) = fid1_debug_info {
+    //     for i in info {
+    //         pretty_print_debug_info(&i);
+    //     }
+    // } else {
+    //     info!("FID {} not found in shard {}", fid1, limit_shard);
+    // }
+
+    // let fid2 = 1245336;
+    // let fid2_debug_info = get_trie_debug_info(&db, &trie, fid2);
+    // if let Ok(info) = fid2_debug_info {
+    //     for i in info {
+    //         pretty_print_debug_info(&i);
+    //     }
+    // } else {
+    //     info!("FID {} not found in shard {}", fid2, limit_shard);
+    // }
+
+    // for fid in 0..(highest_fid + 1) {
+    //     info!(
+    //         "PPTrie {}: FID {} belongs to trie router bucket {}",
+    //         shard_id,
+    //         fid,
+    //         TrieKey::fid_shard(fid)
+    //     );
+    // }
     return Ok(());
     // ====================TEMP
 
     let trie_ctx = merkle_trie::Context::new();
 
     // Go over all the keys for this FID in the trie
-    for fid in 0..highest_fid + 1 {
+    for fid in 0..(highest_fid + 1) {
         if shutdown_signal.load(Ordering::SeqCst) {
             info!(
                 "PPTrie {}: Shutdown signal received during post-processing at FID {}. Stopping.",
@@ -698,6 +927,15 @@ async fn post_process_trie(
         }
         trie.reload(&db)?;
     }
+
+    // After attaching all the roots, recalculate the hashes upto the FID key depth
+    let max_key = TrieKey::for_fid(highest_fid);
+    let mut txn_batch = RocksDbTransactionBatch::new();
+    trie.recalculate_hashes(&trie_ctx, &db, &mut txn_batch, max_key.len())?;
+    db.commit(txn_batch).map_err(|e| TrieError::DatabaseError {
+        source: Box::new(e),
+    })?;
+    trie.reload(&db)?;
 
     // Get the trie root and see if it matches
     let expected_shard_root = metadata.shard_chunk.unwrap().header.unwrap().shard_root;

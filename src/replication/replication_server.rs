@@ -74,10 +74,21 @@ impl proto::replication_service_server::ReplicationService for ReplicationServer
     ) -> Result<Response<proto::GetTrieDebugInfoResponse>, Status> {
         let request = request.into_inner();
 
-        let debug_info = self
-            .replicator
-            .get_trie_debug_info(request.shard_id, request.fid, request.height)
-            .map_err(|e| Status::internal(format!("Failed to get trie debug info: {}", e)))?;
+        let debug_info = if !request.xprefix.is_empty() && request.fid == 0 {
+            // Use the new method for xprefix-based debug info
+            let single_debug_info = self
+                .replicator
+                .get_trie_debug_at_xprefix(request.shard_id, request.height, request.xprefix)
+                .map_err(|e| {
+                    Status::internal(format!("Failed to get trie debug info at xprefix: {}", e))
+                })?;
+            vec![single_debug_info]
+        } else {
+            // Use the original method for fid-based debug info
+            self.replicator
+                .get_trie_debug_info(request.shard_id, request.fid, request.height)
+                .map_err(|e| Status::internal(format!("Failed to get trie debug info: {}", e)))?
+        };
 
         Ok(Response::new(proto::GetTrieDebugInfoResponse {
             debug_info,

@@ -116,45 +116,61 @@ impl Replicator {
     ) -> Result<Vec<TrieNodeDebugInfo>, String> {
         match self.stores.get(shard, height) {
             Some(stores) => {
-                let db = stores.db.clone();
                 let mut result = vec![];
 
                 let trie = stores.trie;
                 let fid_key = TrieKey::for_fid(fid);
                 let xfid_key = trie.get_x_key(&fid_key);
 
-                // For every prefix in xfid_key, get the node's hash
+                // For every prefix in xfid_key, get the node's debug info
                 for i in 0..(xfid_key.len() + 1) {
                     let xprefix = xfid_key[..i].to_vec();
-
-                    let node = trie.get_x_node(&db, &xprefix).ok_or_else(|| {
-                        format!("Failed to get trie node for prefix {:?}", xprefix)
-                    })?;
-                    let node_hash = node.hash();
-
-                    let child_hashes = node
-                        .child_hashes()
-                        .iter()
-                        .map(|(k, v)| ChildHashDebugInfo {
-                            char: *k as u32,
-                            hash: v.clone(),
-                        })
-                        .collect();
-
-                    let debug_info = TrieNodeDebugInfo {
-                        xprefix,
-                        hash: node_hash,
-                        child_hashes,
-                    };
+                    let debug_info = self.get_trie_debug_at_xprefix(shard, height, xprefix)?;
                     result.push(debug_info);
                 }
 
-                return Ok(result);
+                Ok(result)
             }
-            None => {
-                return Err(format!("No stores found for shard {}", shard));
+            None => Err(format!("No stores found for shard {}", shard)),
+        }
+    }
+
+    pub fn get_trie_debug_at_xprefix(
+        &self,
+        shard: u32,
+        height: u64,
+        xprefix: Vec<u8>,
+    ) -> Result<TrieNodeDebugInfo, String> {
+        match self.stores.get(shard, height) {
+            Some(stores) => {
+                let db = stores.db.clone();
+                let trie = stores.trie;
+
+                let node = trie
+                    .get_x_node(&db, &xprefix)
+                    .ok_or_else(|| format!("Failed to get trie node for prefix {:?}", xprefix))?;
+                let node_hash = node.hash();
+
+                let child_hashes = node
+                    .child_hashes()
+                    .iter()
+                    .map(|(k, v)| ChildHashDebugInfo {
+                        char: *k as u32,
+                        hash: v.clone(),
+                    })
+                    .collect();
+
+                let debug_info = TrieNodeDebugInfo {
+                    xprefix,
+                    hash: node_hash,
+                    child_hashes,
+                    items: node.items() as u64,
+                };
+
+                Ok(debug_info)
             }
-        };
+            None => Err(format!("No stores found for shard {}", shard)),
+        }
     }
 
     pub fn latest_transactions_for_fid(
@@ -216,11 +232,13 @@ impl Replicator {
             (Some(_), Some(_)) => unreachable!(), // Already handled above
         };
 
-        let iterator_fid = cursor.token.fid().saturating_sub(1);
-        let fid_iterator = FIDIterator::new(stores.db.clone(), iterator_fid);
+        // let iterator_fid = cursor.token.fid().saturating_sub(1);
+        // let fid_iterator = FIDIterator::new(stores.db.clone(), iterator_fid);
+        let fid_start = cursor.token.fid();
+        let end_fid = self.get_highest_fid_for_shard(shard, height)? + 20_000;
         let mut transactions = vec![];
 
-        for fid in fid_iterator.into_iter() {
+        for fid in fid_start..=end_fid {
             // This is commented out, but extremely useful for debugging. It diffs the merkle trie and the DB stores to
             // find message inconsistencies for FIDs
             // if let Err(e) = check_db_trie_consistency_for_fid(&stores, fid) {

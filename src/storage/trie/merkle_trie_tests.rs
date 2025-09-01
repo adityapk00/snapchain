@@ -163,6 +163,13 @@ mod tests {
         db.commit(txn_batch).unwrap();
         let root_hash = trie.root_hash().unwrap();
 
+        // Just do recalculate hashes first, this should be a no-op
+        let mut txn_batch = RocksDbTransactionBatch::new();
+        trie.recalculate_hashes(ctx, db, &mut txn_batch, 6).unwrap();
+        db.commit(txn_batch).unwrap();
+
+        assert_eq!(trie.root_hash().unwrap(), root_hash);
+
         // Key for the node to mess up and then re attach
         let key = &key_vecs[0][0..6]; // try to attach this node
         let xkey = (key_conv.expand)(key); // with this expanded key
@@ -210,12 +217,20 @@ mod tests {
 
         // Now, attach the prefix node to the trie
         let mut txn_batch = RocksDbTransactionBatch::new();
-        let r = trie.attach_to_root(ctx, db, &mut txn_batch, &key);
-        db.commit(txn_batch).unwrap();
+        let r1 = trie.attach_to_root(ctx, db, &mut txn_batch, &key);
 
+        // Assert that the 6*2 nodes were re-written (*2 because the key is expanded to nibbles for 16 trie branch factor)
+        assert_eq!(txn_batch.len(), 6 * 2);
+        db.commit(txn_batch).unwrap();
+        trie.reload(db).unwrap();
+        assert!(r1.is_ok());
+
+        let mut txn_batch = RocksDbTransactionBatch::new();
+        let r = trie.recalculate_hashes(ctx, db, &mut txn_batch, 6);
+        db.commit(txn_batch).unwrap();
         assert!(r.is_ok());
 
-        let (is_attached, was_created) = r.unwrap();
+        let (is_attached, was_created) = r1.unwrap();
         assert!(is_attached && was_created); // Assert that it was attached
 
         // Now, the root hashes should match the original
@@ -226,12 +241,16 @@ mod tests {
 
         // Attaching it again should be a no-op
         let mut txn_batch = RocksDbTransactionBatch::new();
-        let r = trie.attach_to_root(ctx, db, &mut txn_batch, &key);
+        let r1 = trie.attach_to_root(ctx, db, &mut txn_batch, &key);
         db.commit(txn_batch).unwrap();
+        assert!(r1.is_ok());
 
+        let mut txn_batch = RocksDbTransactionBatch::new();
+        let r = trie.recalculate_hashes(ctx, db, &mut txn_batch, 6);
+        db.commit(txn_batch).unwrap();
         assert!(r.is_ok());
 
-        let (is_attached, was_created) = r.unwrap();
+        let (is_attached, was_created) = r1.unwrap();
         assert!(is_attached && !was_created); // Assert that it was not created again
 
         // root hashes should still match the original
