@@ -784,6 +784,19 @@ impl BlockEngine {
             EngineVersion::version_for(&FarcasterTime::new(block_timestamp), self.network);
         if version.is_enabled(ProtocolFeature::WriteDataToShardZero) {
             let mut txn = RocksDbTransactionBatch::new();
+
+            // Reset the generator ID so that events get proper sequence number
+            let block_number = block
+                .header
+                .as_ref()
+                .map(|b| b.height.as_ref().map(|b| b.block_number))
+                .flatten()
+                .unwrap_or(0);
+            self.stores
+                .onchain_event_store
+                .store_event_handler
+                .set_current_height(block_number);
+
             match self.replay_proposal(
                 &mut txn,
                 &block.transactions,
